@@ -19,12 +19,13 @@
     ['x-captcha-token', 'PIKPAK_CAPTCHA_TOKEN'],
   ];
   let credentials = null;
+  let busy = false;
   let button;
   let status;
   let message = '请先登录并操作 PikPak，等待包含完整凭据的请求。';
 
   function render() {
-    if (button) button.disabled = !credentials;
+    if (button) button.disabled = busy || !credentials;
     if (status) status.textContent = message;
   }
 
@@ -121,21 +122,40 @@
     status = document.createElement('p');
     status.setAttribute('role', 'status');
     status.setAttribute('aria-live', 'polite');
-    button.addEventListener('click', () => {
+    button.addEventListener('click', async () => {
+      if (busy) return;
       if (!credentials) {
         message = '尚未获取完整凭据，请先登录并操作 PikPak。';
         render();
         return;
       }
-      const text = fields.map(([, key], i) =>
-        `${key}="${credentials[i].replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).join('\n') + '\n';
+      const snapshot = credentials.slice();
+      busy = true;
+      message = '正在获取本次复制所需的写入凭据，请稍候。';
+      render();
       try {
+        const captcha = page.loginUI?.login?.captcha;
+        const manager = captcha?._captchaTokenInfoManager;
+        if (!manager || manager._originDeviceId !== snapshot[1]) throw new Error();
+        const info = await manager._localCaptchaTokenInfoManager.getCaptchaTokenInfo();
+        if (!info?.meta || !['captcha_sign', 'client_version', 'package_name', 'user_id', 'timestamp']
+          .every(key => info.meta[key] !== undefined && info.meta[key] !== null && info.meta[key] !== '')) {
+          throw new Error();
+        }
+        snapshot[2] = await captcha.getCaptchaToken('POST:/drive/v1/files', info.meta, true);
+        if (typeof snapshot[2] !== 'string' || !snapshot[2] || /[\r\n\0]/.test(snapshot[2])
+          || !credentials || credentials[0] !== snapshot[0] || credentials[1] !== snapshot[1]
+          || manager._originDeviceId !== snapshot[1]) throw new Error();
+        const text = fields.map(([, key], i) =>
+          `${key}="${snapshot[i].replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).join('\n') + '\n';
         GM_setClipboard(text, 'text', () => {
           message = '已复制。请粘贴到 Python 文件夹的 .env，勿分享凭据。';
           render();
         });
       } catch {
-        message = '复制失败，请检查 Tampermonkey 剪贴板权限后重试。';
+        message = '未复制：无法获取写入凭据或登录状态已改变。请刷新并登录 PikPak，操作后重试，并检查剪贴板权限。';
+      } finally {
+        busy = false;
         render();
       }
     });
