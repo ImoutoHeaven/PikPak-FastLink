@@ -6,6 +6,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 
 from pikpak_fastlink.api import Decision, DecisionKind
+from pikpak_fastlink.config import normalize_remote_path
 from pikpak_fastlink.models import normalize_gcid, normalize_remote_id, parse_size
 
 
@@ -218,6 +219,21 @@ class RemoteTreeCoordinator:
         if item.get("kind") != "drive#folder":
             raise RuntimeError(f"file-directory collision: {name}")
         return str(item["id"])
+
+    def find_directory_path(self, path: str, *, max_retries: int) -> str:
+        """Return the ID of an existing folder at an absolute cloud path; never creates."""
+        folder_id = ""
+        walked = ""
+        # The root path "/" yields no names and resolves to the root ID "".
+        for name in filter(None, normalize_remote_path(path)[1:].split("/")):
+            walked += f"/{name}"
+            child = self.find_directory(
+                parent_id=folder_id, name=name, max_retries=max_retries
+            )
+            if child is None:
+                raise RuntimeError(f"remote folder not found: {walked}")
+            folder_id = child
+        return folder_id
 
 
 def create_remote_directories(

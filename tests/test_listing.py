@@ -90,6 +90,60 @@ def test_trashed_file_does_not_block_import_but_unverified_file_does(overrides):
         ), max_retries=0) == expected
 
 
+def folder(file_id, name):
+    return {"id": file_id, "name": name, "kind": "drive#folder", "trashed": False}
+
+
+class TreeClient(PagesClient):
+    """Serves each parent's listing as numbered pages; mutations still fail."""
+
+    def __init__(self, tree):
+        self.tree = tree
+        self.calls = []
+
+    def list_page(self, *, parent_id, page_token="", page_size=500):
+        self.calls.append(parent_id)
+        pages = self.tree[parent_id]
+        index = int(page_token or 0)
+        return Decision(DecisionKind.COMPLETED, payload={
+            "items": pages[index],
+            "next_page_token": str(index + 1) if index + 1 < len(pages) else "",
+        })
+
+
+PATH_TREE = {
+    "": [[item(0, name="a.bin"), folder("dup", "Dup")], [folder("m", "Media")]],
+    "m": [[folder("s", "\u52d5\u753b Shows "), folder("x", "media")]],
+    "s": [[]],
+    "dup": [[folder("d1", "x"), folder("d2", "x")]],
+}
+
+
+@pytest.mark.parametrize("path, expected", [
+    ("/", ""),
+    ("/Media", "m"),
+    ("/Media/\u52d5\u753b Shows /", "s"),
+])
+def test_directory_path_resolves_existing_folder_across_pages(path, expected):
+    client = TreeClient(PATH_TREE)
+    assert RemoteTreeCoordinator(client).find_directory_path(path, max_retries=0) == expected
+
+
+@pytest.mark.parametrize("path, error", [
+    ("/Missing", "not found"),
+    ("/MEDIA", "not found"),
+    ("/Media/\u52d5\u753b Shows", "not found"),
+    ("/a.bin", "collision"),
+    ("/a.bin/child", "collision"),
+    ("/Dup/x", "duplicate"),
+    ("Media", "remote path"),
+])
+def test_directory_path_rejects_missing_file_or_ambiguous_folder(path, error):
+    client = TreeClient(PATH_TREE)
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        RemoteTreeCoordinator(client).find_directory_path(path, max_retries=0)
+
+
 @pytest.mark.parametrize("command", ["import-json", "batch-import-json", "batch-check-json", "export-json", "compare-json", "compare-path"])
 def test_commands_preserve_artifacts_on_invalid_listing_then_resume(command, tmp_path, monkeypatch, capsys):
     source = tmp_path / "input" / "source.json"

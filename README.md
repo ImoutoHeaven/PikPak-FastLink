@@ -44,9 +44,33 @@ New captcha tokens are cached per action in memory. Before the next request, the
 
 An expired access token, an interactive challenge, or rejection after renewal stops the command while preserving resumable state. Complete login or verification in the browser, update `.env`, and rerun the command. Python does not rewrite `.env` or solve challenges. Public web signing constants are stored in `pikpak_fastlink/captcha.py` and must be updated if PikPak changes that configuration. Chrome impersonation does not guarantee that risk checks will accept a request.
 
-## Folder IDs and manifest format
+## Remote folders and manifest format
 
-Remote arguments use PikPak's opaque folder IDs, available as `parent_id` in browser requests. `root` selects the cloud-drive root. Use a dedicated `probe/` folder and its children for initial live validation.
+Choose exactly one ID or path selector for each command:
+
+| Command | Folder ID | Cloud path |
+|---|---|---|
+| `import-json`, `batch-import-json`, `batch-check-json` | `--target-parent-id` | `--target-path` |
+| `export-json` | `--source-parent-id` | `--source-path` |
+| `compare-folder` | `--remote-folder-id` | `--remote-path` |
+
+ID flags accept PikPak's opaque folder IDs, available as `parent_id` in browser requests; `root` selects the cloud-drive root. Path flags accept absolute cloud paths such as `/probe/Movies`, with `/` selecting the root. Paths are independent of the local working directory and the browser's current directory. Names preserve case, Unicode, and spaces; quote paths containing spaces. One trailing slash is accepted. Backslashes, repeated separators, and `.` or `..` segments are rejected.
+
+The selected directory must already exist. Resolution follows complete listings one directory at a time; missing directories, file-directory collisions, or ambiguous listings fail instead of creating or guessing a target. Imports can still create manifest subdirectories beneath the resolved target.
+
+Paths resolve to actual folder IDs before checkpoint planning. Resumption remains bound to those IDs, so deleting and recreating a directory at the same path requires new state. ID-mode import dry runs remain offline. Path-mode dry runs require credentials for read-only lookup and perform no cloud writes.
+
+For example, with `/probe/Movies` already present:
+
+```bash
+python pikpak.py import-json --file movies.json --target-path /probe/Movies --state-file .state/movies.sqlite3 --workers 4
+python pikpak.py export-json --source-path /probe/Movies --output-file remote.json --state-file .state/export.state.json
+python pikpak.py compare-folder --local-json movies.json --remote-path /probe/Movies --output-file missing.json
+```
+
+On Windows Git Bash, prefix path-selector commands with `MSYS_NO_PATHCONV=1` to prevent MSYS from converting cloud paths into local filesystem paths. PowerShell and native Windows shells do not need this prefix.
+
+Use a dedicated `probe/` folder and its children for initial live validation.
 
 Import and export share this JSON format:
 
@@ -101,7 +125,7 @@ Rerun an interrupted export with the same arguments to resume its checkpoint. Co
 ## Retries and resumption
 
 - Rerun with the same manifest, target ID, and state path; completed records are skipped.
-- State is bound to the manifest's SHA-256 and the target directory. Changed input or a different target requires new state.
+- State is bound to the manifest's SHA-256 and the resolved target directory ID. Changed input or a different target requires new state.
 - HTTP 429, server errors, and transport failures receive bounded retries. `captcha_invalid` first triggers one issuance attempt for the current action. Unrecoverable authentication or interactive verification stops further scheduling.
 - If a creation response is lost, the tool queries the target directory before deciding whether to retry, avoiding blind duplicate creation.
 - Failed and non-reusable records are written to a `.retry.export.json` beside the state file.
@@ -124,7 +148,7 @@ python pikpak.py batch-import-json --input-dir manifests --target-parent-id <fol
 python pikpak.py batch-check-json --input-dir manifests --target-parent-id <folder-id> --state-dir .state/check --output-dir deltas --with-checksum
 ```
 
-Batch commands recursively discover JSON manifests and maintain separate state for each one. All paths are relative to the same remote target; JSON file names do not introduce another directory level. Imports validate cross-manifest path conflicts before creating files. Input, state, and delta-output directories must not overlap.
+Batch commands recursively discover JSON manifests and maintain separate state for each one. With `--target-path`, all discovered manifest headers must be valid before cloud lookup or state creation; an invalid header stops batch startup. All paths are relative to the same remote target; JSON file names do not introduce another directory level. Imports validate cross-manifest path conflicts before creating files. Input, state, and delta-output directories must not overlap.
 
 `batch-check-json` checks paths by default. `--with-checksum` also compares GCID and size. Output `.delta.export.json` files contain only mismatched records and can be imported. Incomplete remote files are not matches. Completed checks reuse their stored results; use a new state directory to compare remote changes again.
 

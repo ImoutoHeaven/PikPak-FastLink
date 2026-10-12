@@ -20,6 +20,61 @@ def test_root_literal_maps_to_empty_parent_id(tmp_path):
     assert config.target_parent_id == ""
 
 
+SELECTOR_COMMANDS = {
+    "import-json": (
+        ["--file", "in.json", "--state-file", "state.sqlite3"],
+        "--target-parent-id", "--target-path", "target_path",
+    ),
+    "batch-import-json": (
+        ["--input-dir", "in", "--state-dir", "state"],
+        "--target-parent-id", "--target-path", "target_path",
+    ),
+    "batch-check-json": (
+        ["--input-dir", "in", "--state-dir", "state", "--output-dir", "out"],
+        "--target-parent-id", "--target-path", "target_path",
+    ),
+    "export-json": (
+        ["--output-file", "out.json", "--state-file", "state.json"],
+        "--source-parent-id", "--source-path", "source_path",
+    ),
+    "compare-folder": (
+        ["--local-folder", "."],
+        "--remote-folder-id", "--remote-path", "remote_path",
+    ),
+}
+
+
+@pytest.mark.parametrize("command", SELECTOR_COMMANDS)
+@pytest.mark.parametrize("raw, expected", [
+    ("/", "/"),
+    ("/Media", "/Media"),
+    ("/Media/\u52d5\u753b Shows /", "/Media/\u52d5\u753b Shows "),
+])
+def test_remote_path_selects_folder_by_exact_path(command, raw, expected):
+    options, _id_flag, path_flag, field = SELECTOR_COMMANDS[command]
+    _args, config = parse_args([command, *options, path_flag, raw])
+    assert getattr(config, field) == expected
+
+
+@pytest.mark.parametrize("command", SELECTOR_COMMANDS)
+@pytest.mark.parametrize("selectors", [[], ["id", "path"]])
+def test_remote_folder_requires_exactly_one_id_or_path(command, selectors):
+    options, id_flag, path_flag, _field = SELECTOR_COMMANDS[command]
+    values = {"id": [id_flag, "root"], "path": [path_flag, "/Media"]}
+    with pytest.raises(SystemExit):
+        parse_args([command, *options, *(arg for s in selectors for arg in values[s])])
+
+
+@pytest.mark.parametrize("path", [
+    "", "   ", "Media", "./Media", "\\Media", "/Media\\Shows", "//",
+    "/Media//Shows", "/Media//", "/./Media", "/Media/..", "/Media/.",
+])
+def test_invalid_remote_path_is_rejected_before_any_request(path):
+    with pytest.raises(ValueError, match="remote path"):
+        parse_args(["import-json", "--file", "in.json", "--state-file", "s.sqlite3",
+                    "--target-path", path])
+
+
 def test_invalid_worker_count_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="workers"):
         parse_args(

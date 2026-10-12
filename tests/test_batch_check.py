@@ -49,6 +49,7 @@ def config(tmp_path, *, mode="with_checksum"):
     return SimpleNamespace(
         input_dir=input_dir,
         target_parent_id="",
+        target_path=None,
         state_dir=tmp_path / "state",
         output_dir=tmp_path / "output",
         workers=2,

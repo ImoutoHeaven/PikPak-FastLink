@@ -15,8 +15,10 @@ class FakeClient:
     def __init__(self):
         self.children = {"": {}}
         self.transfer_calls = 0
+        self.listed = []
 
     def list_page(self, *, parent_id, page_token='', page_size=500):
+        self.listed.append(parent_id)
         items = (
             list(self.children.setdefault(parent_id, {}).values()) if not page_token else []
         )
@@ -160,6 +162,100 @@ def test_dry_run_does_not_load_credentials_or_touch_retry_output(tmp_path, monke
         == 0
     )
     assert retry.read_text(encoding="utf-8") == "keep"
+
+
+OTHER_GCID = "0" * 40
+PATH_COMMANDS = ["import-json", "batch-import-json", "batch-check-json", "export-json", "compare-folder"]
+
+
+def remote_file(file_id, name, gcid):
+    return {"id": file_id, "name": name, "size": "123", "hash": gcid,
+            "kind": "drive#file", "phase": "PHASE_TYPE_COMPLETE", "trashed": False}
+
+
+def media_client(media_id="media-id", files=True):
+    client = FakeClient()
+    client.children = {
+        "": {"root.rar": remote_file("root-file", "root.rar", OTHER_GCID),
+             "Media": {"id": media_id, "name": "Media", "kind": "drive#folder", "trashed": False}},
+        media_id: {"a.rar": remote_file("a-file", "a.rar", GCID)} if files else {},
+    }
+    return client
+
+
+def path_argv(command, tmp_path, path):
+    source = tmp_path / "input" / "one.json"
+    source.parent.mkdir(exist_ok=True)
+    source.write_text(json.dumps({"files": [{"path": "/a.rar", "gcid": GCID, "size": "123"}]}), encoding="utf-8")
+    state = tmp_path / "state"
+    if command == "import-json":
+        return [command, "--file", str(source), "--state-file", str(state / "one.sqlite3"), "--target-path", path]
+    if command == "export-json":
+        return [command, "--output-file", str(tmp_path / "out.json"), "--state-file", str(state / "export.json"), "--source-path", path]
+    if command == "compare-folder":
+        return [command, "--local-json", str(source), "--output-file", str(tmp_path / "out.json"), "--remote-only", "--remote-path", path]
+    argv = [command, "--input-dir", str(source.parent), "--state-dir", str(state), "--target-path", path]
+    return argv + (["--output-dir", str(tmp_path / "delta")] if command == "batch-check-json" else [])
+
+
+@pytest.mark.parametrize("command", PATH_COMMANDS)
+def test_remote_path_scopes_command_to_resolved_folder_id(command, tmp_path, monkeypatch, capsys):
+    client = media_client()
+    monkeypatch.setattr(app, "build_client", lambda: client)
+    argv = path_argv(command, tmp_path, "/Media/")
+
+    assert app.run_cli(argv) == 0
+    # Media already holds a.rar and the root holds another file, so any root-scoped run differs.
+    assert client.transfer_calls == 0
+    assert not (tmp_path / "delta" / "one.delta.export.json").exists()
+    if command in {"export-json", "compare-folder"}:
+        files = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))["files"]
+        assert [f["path"] for f in files] == (["/a.rar"] if command == "export-json" else [])
+        return
+    # Recreating the same path gives a new folder ID, which the saved ID-bound state rejects.
+    recreated = media_client("media-2")
+    monkeypatch.setattr(app, "build_client", lambda: recreated)
+    capsys.readouterr()
+    assert app.run_cli(argv) == 1
+    assert "mismatch" in capsys.readouterr().out
+    assert "media-2" not in recreated.listed and recreated.transfer_calls == 0
+
+
+@pytest.mark.parametrize("command", PATH_COMMANDS)
+@pytest.mark.parametrize("path", ["/Missing", "/root.rar"])
+def test_unresolvable_remote_path_fails_before_writing_state(command, path, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(app, "build_client", media_client)
+    argv = path_argv(command, tmp_path, path)
+
+    assert app.run_cli(argv) == 1
+    assert "Error:" in capsys.readouterr().out
+    assert [p.name for p in tmp_path.iterdir()] == ["input"]
+
+
+@pytest.mark.parametrize("command", ["batch-import-json", "batch-check-json"])
+def test_batch_remote_path_checks_local_headers_before_lookup(command, tmp_path, monkeypatch, capsys):
+    argv = path_argv(command, tmp_path, "/Media")
+    (tmp_path / "input" / "bad.json").write_text("[]", encoding="utf-8")
+    client = media_client()
+    monkeypatch.setattr(app, "build_client", lambda: client)
+
+    assert app.run_cli(argv) == 1
+    assert "bad.json" in capsys.readouterr().out
+    assert client.listed == []
+
+
+@pytest.mark.parametrize("command", ["import-json", "batch-import-json"])
+@pytest.mark.parametrize("selector", [["--target-parent-id", "root"], ["--target-path", "/Media"]])
+def test_dry_run_reads_only_and_id_mode_stays_offline(command, selector, tmp_path, monkeypatch, capsys):
+    argv = path_argv(command, tmp_path, "/")[:-2] + selector + ["--dry-run"]
+    client = media_client(files=False)
+    built = []
+    monkeypatch.setattr(app, "build_client", lambda: built.append(1) or client)
+
+    assert app.run_cli(argv) == 0
+    assert "Dry run: no remote mutations performed" in capsys.readouterr().out
+    assert built == ([] if selector[0] == "--target-parent-id" else [1])
+    assert client.transfer_calls == 0 and client.children["media-id"] == {}
 
 
 def test_generate_json_cli_needs_no_credentials(tmp_path, monkeypatch):

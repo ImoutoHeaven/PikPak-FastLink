@@ -109,15 +109,21 @@ def normalize_record(entry: object, *, source_index: int) -> SourceRecord:
 
 
 def inspect_export_scope(path: Path) -> ExportScope:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    check_export_header(path)
+    return ExportScope(source_sha256=hasher.hexdigest())
+
+
+def check_export_header(path: Path) -> None:
+    """Check only the root object and files-array header, without reading records."""
     import ijson
 
-    hasher = hashlib.sha256()
     saw_root = False
     saw_files = False
     try:
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                hasher.update(chunk)
         with path.open("rb") as handle:
             for prefix, event, _value in ijson.parse(handle):
                 if not saw_root:
@@ -135,7 +141,6 @@ def inspect_export_scope(path: Path) -> ExportScope:
         raise ValueError("export root must be an object")
     if not saw_files:
         raise ValueError("files must be an array")
-    return ExportScope(source_sha256=hasher.hexdigest())
 
 
 def iter_export_records(path: Path) -> Iterator[SourceRecord]:

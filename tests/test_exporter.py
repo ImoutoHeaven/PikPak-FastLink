@@ -48,6 +48,7 @@ class FakeListClient:
 def config(tmp_path, source=""):
     return SimpleNamespace(
         source_parent_id=source,
+        source_path=None,
         output_file=tmp_path / "out.json",
         state_file=tmp_path / "export.state.json",
         workers=2,

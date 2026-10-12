@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 from pikpak_fastlink.check_state import open_or_plan_check_state
 from pikpak_fastlink.import_state import open_or_plan_import_state
-from pikpak_fastlink.models import inspect_export_scope, normalize_gcid, parse_size
+from pikpak_fastlink.models import (
+    check_export_header,
+    inspect_export_scope,
+    normalize_gcid,
+    parse_size,
+)
 from pikpak_fastlink.runner import (
     CredentialFatalError,
     RemoteTreeCoordinator,
@@ -71,6 +76,8 @@ def run_batch_import(*, config, client) -> int:
             state_dir=config.state_dir,
             suffix=".import-state.sqlite3",
         )
+        coordinator = RemoteTreeCoordinator(client)
+        config = _resolve_target(config, coordinator, jobs)
         config.state_dir.mkdir(parents=True, exist_ok=True)
         planned, preflight_failed = _preflight_import(jobs=jobs, config=config)
     except (ValueError, OSError) as exc:
@@ -80,7 +87,6 @@ def run_batch_import(*, config, client) -> int:
     if config.dry_run:
         safe_print("Dry run: no remote mutations performed")
         return 1 if preflight_failed else 0
-    coordinator = RemoteTreeCoordinator(client)
 
     def child(job: BatchJob):
         state = None
@@ -135,6 +141,20 @@ def run_batch_import(*, config, client) -> int:
     return 1 if summary["failed"] or summary["credential_fatal"] else 0
 
 
+def _resolve_target(config, coordinator, jobs: list[BatchJob]):
+    """Resolve --target-path once, after local header checks and before any job state exists."""
+    if config.target_path is None:
+        return config
+    for job in jobs:
+        try:
+            check_export_header(job.json_path)
+        except ValueError as exc:
+            raise ValueError(f"{job.relative_path.as_posix()}: {exc}") from exc
+    return replace(config, target_parent_id=coordinator.find_directory_path(
+        config.target_path, max_retries=config.max_retries
+    ))
+
+
 def _preflight_import(*, jobs: list[BatchJob], config) -> tuple[list[BatchJob], int]:
     planned = []
     files_by_job: dict[BatchJob, list[str]] = {}
@@ -182,12 +202,13 @@ def run_batch_check(*, config, client) -> int:
             output_dir=config.output_dir,
             suffix=".check-state.sqlite3",
         )
+        coordinator = RemoteTreeCoordinator(client)
+        config = _resolve_target(config, coordinator, jobs)
         config.state_dir.mkdir(parents=True, exist_ok=True)
         config.output_dir.mkdir(parents=True, exist_ok=True)
     except (ValueError, OSError) as exc:
         safe_print(f"Batch startup failed: {exc}")
         return 1
-    coordinator = RemoteTreeCoordinator(client)
 
     def child(job: BatchJob):
         state = None

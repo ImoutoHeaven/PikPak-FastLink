@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from pikpak_fastlink.api import PikPakClient
@@ -26,6 +27,11 @@ def build_client():
     )
 
 
+def _import_client(config):
+    # ID-mode dry runs stay offline; path mode needs read-only lookups even when dry.
+    return None if config.dry_run and config.target_path is None else build_client()
+
+
 def run_cli(argv=None) -> int:
     state = None
     finalize_import = False
@@ -44,7 +50,7 @@ def run_cli(argv=None) -> int:
 
             return run_batch_import(
                 config=config,
-                client=None if config.dry_run else build_client(),
+                client=_import_client(config),
             )
         if config.command == "batch_check_json":
             from pikpak_fastlink.batch import run_batch_check
@@ -56,6 +62,12 @@ def run_cli(argv=None) -> int:
             return run_compare_folder(client=build_client(), config=config)
 
         scope = inspect_export_scope(config.file_path)
+        client = _import_client(config)
+        coordinator = RemoteTreeCoordinator(client)
+        if config.target_path is not None:
+            config = replace(config, target_parent_id=coordinator.find_directory_path(
+                config.target_path, max_retries=config.max_retries
+            ))
         state = open_or_plan_import_state(
             state_path=config.state_file,
             source_path=config.file_path,
@@ -70,7 +82,6 @@ def run_cli(argv=None) -> int:
             )
             safe_print("Dry run: no remote mutations performed")
             return 0
-        client = build_client()
         finalize_import = True
         if config.retry_failed:
             state.reset_retryable()
@@ -78,7 +89,6 @@ def run_cli(argv=None) -> int:
             f"Startup: files={state.stats['total']} pending={state.count_pending()} "
             f"folders={len(state.pending_folder_rows())} workers={state.workers}"
         )
-        coordinator = RemoteTreeCoordinator(client)
         create_remote_directories(
             state=state,
             coordinator=coordinator,

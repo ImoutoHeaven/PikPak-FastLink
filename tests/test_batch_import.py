@@ -54,6 +54,7 @@ def make_config(tmp_path):
     return SimpleNamespace(
         input_dir=input_dir,
         target_parent_id="",
+        target_path=None,
         state_dir=tmp_path / "state",
         workers=2,
         json_parallelism=2,

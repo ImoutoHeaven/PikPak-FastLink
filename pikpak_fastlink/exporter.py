@@ -5,7 +5,7 @@ import os
 import sqlite3
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from pikpak_fastlink.models import (
@@ -17,7 +17,7 @@ from pikpak_fastlink.models import (
     parse_size,
     write_export_json,
 )
-from pikpak_fastlink.runner import list_remote_children, safe_print
+from pikpak_fastlink.runner import RemoteTreeCoordinator, list_remote_children, safe_print
 
 
 @dataclass(frozen=True)
@@ -54,10 +54,15 @@ def run_compare_folder(*, client, config) -> int:
             for path in root.rglob("*")
             if path.is_file()
         }
+    remote_folder_id = config.remote_folder_id
+    if config.remote_path is not None:
+        remote_folder_id = RemoteTreeCoordinator(client).find_directory_path(
+            config.remote_path, max_retries=config.max_retries
+        )
     remote_records = []
     remote_paths: set[str] = set()
-    pending = [DirectoryTask(config.remote_folder_id, "")]
-    seen = {config.remote_folder_id}
+    pending = [DirectoryTask(remote_folder_id, "")]
+    seen = {remote_folder_id}
     while pending:
         child_dirs, records = _scan_directory(
             client=client,
@@ -104,6 +109,10 @@ def run_compare_folder(*, client, config) -> int:
 
 
 def run_export(*, client, config) -> int:
+    if config.source_path is not None:
+        config = replace(config, source_parent_id=RemoteTreeCoordinator(client).find_directory_path(
+            config.source_path, max_retries=config.max_retries
+        ))
     state_path = config.state_file
     records_path = state_path.with_suffix(".records.jsonl")
     finalize_db = state_path.with_suffix(".finalize.sqlite3")

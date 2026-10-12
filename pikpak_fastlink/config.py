@@ -13,10 +13,27 @@ def normalize_parent_id(value: object) -> str:
     return normalized
 
 
+def normalize_remote_path(value: str) -> str:
+    """Validate an absolute cloud folder path; '/' is the root and one trailing '/' is allowed."""
+    if not value.startswith("/") or "\\" in value:
+        raise ValueError(f"remote path must be absolute and use '/': {value!r}")
+    names = value[1:].removesuffix("/").split("/") if value != "/" else []
+    if any(name in {"", ".", ".."} for name in names):
+        raise ValueError(f"remote path has an empty, '.' or '..' segment: {value!r}")
+    return "/" + "/".join(names)
+
+
+def _remote_selector(folder_id, path) -> tuple[str | None, str | None]:
+    # A path selector leaves the ID unset until the command resolves it remotely.
+    if path is None:
+        return normalize_parent_id(folder_id), None
+    return None, normalize_remote_path(path)
+
+
 @dataclass(frozen=True)
 class ImportConfig:
     file_path: Path
-    target_parent_id: str
+    target_parent_id: str | None
     state_file: Path
     workers: int
     max_retries: int
@@ -24,22 +41,24 @@ class ImportConfig:
     retry_failed: bool
     dry_run: bool
     command: str = "import_json"
+    target_path: str | None = None
 
 
 @dataclass(frozen=True)
 class ExportConfig:
-    source_parent_id: str
+    source_parent_id: str | None
     output_file: Path
     state_file: Path
     workers: int
     max_retries: int
     command: str = "export_json"
+    source_path: str | None = None
 
 
 @dataclass(frozen=True)
 class BatchImportConfig:
     input_dir: Path
-    target_parent_id: str
+    target_parent_id: str | None
     state_dir: Path
     workers: int
     json_parallelism: int
@@ -48,12 +67,13 @@ class BatchImportConfig:
     retry_failed: bool
     dry_run: bool
     command: str = "batch_import_json"
+    target_path: str | None = None
 
 
 @dataclass(frozen=True)
 class BatchCheckConfig:
     input_dir: Path
-    target_parent_id: str
+    target_parent_id: str | None
     state_dir: Path
     output_dir: Path
     workers: int
@@ -61,6 +81,7 @@ class BatchCheckConfig:
     max_retries: int
     compare_mode: str
     command: str = "batch_check_json"
+    target_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,10 +97,11 @@ class CompareFolderConfig:
     local_folder: Path | None
     local_json: Path | None
     output_file: Path | None
-    remote_folder_id: str
+    remote_folder_id: str | None
     max_retries: int
     compare_mode: str
     command: str = "compare_folder"
+    remote_path: str | None = None
 
 
 def build_config(args):
@@ -98,9 +120,11 @@ def build_config(args):
         retry_file = state_file.with_suffix(".retry.export.json")
         if file_path in {state_file, retry_file}:
             raise ValueError("input file must be distinct from import state artifacts")
+        target_parent_id, target_path = _remote_selector(args.target_parent_id, args.target_path)
         return ImportConfig(
             file_path=file_path,
-            target_parent_id=normalize_parent_id(args.target_parent_id),
+            target_parent_id=target_parent_id,
+            target_path=target_path,
             state_file=state_file,
             workers=args.workers,
             max_retries=args.max_retries,
@@ -114,17 +138,21 @@ def build_config(args):
         artifacts = [output, *_export_artifacts(state, output)]
         if len(set(artifacts)) != len(artifacts):
             raise ValueError("output_file must be distinct from export state artifacts")
+        source_parent_id, source_path = _remote_selector(args.source_parent_id, args.source_path)
         return ExportConfig(
-            source_parent_id=normalize_parent_id(args.source_parent_id),
+            source_parent_id=source_parent_id,
+            source_path=source_path,
             output_file=output,
             state_file=state,
             workers=args.workers,
             max_retries=args.max_retries,
         )
     if args.command == "batch_import_json":
+        target_parent_id, target_path = _remote_selector(args.target_parent_id, args.target_path)
         return BatchImportConfig(
             input_dir=Path(args.input_dir).resolve(),
-            target_parent_id=normalize_parent_id(args.target_parent_id),
+            target_parent_id=target_parent_id,
+            target_path=target_path,
             state_dir=Path(args.state_dir).resolve(),
             workers=args.workers,
             json_parallelism=args.json_parallelism,
@@ -136,9 +164,11 @@ def build_config(args):
     if args.command == "batch_check_json":
         if args.exist_only and args.with_checksum:
             raise ValueError("--exist-only and --with-checksum are mutually exclusive")
+        target_parent_id, target_path = _remote_selector(args.target_parent_id, args.target_path)
         return BatchCheckConfig(
             input_dir=Path(args.input_dir).resolve(),
-            target_parent_id=normalize_parent_id(args.target_parent_id),
+            target_parent_id=target_parent_id,
+            target_path=target_path,
             state_dir=Path(args.state_dir).resolve(),
             output_dir=Path(args.output_dir).resolve(),
             workers=args.workers,
@@ -167,6 +197,7 @@ def build_config(args):
             )
         ):
             raise ValueError("output file must be distinct from local JSON")
+        remote_folder_id, remote_path = _remote_selector(args.remote_folder_id, args.remote_path)
         return CompareFolderConfig(
             local_folder=(
                 Path(args.local_folder).resolve()
@@ -175,7 +206,8 @@ def build_config(args):
             ),
             local_json=source,
             output_file=output,
-            remote_folder_id=normalize_parent_id(args.remote_folder_id),
+            remote_folder_id=remote_folder_id,
+            remote_path=remote_path,
             max_retries=args.max_retries,
             compare_mode=args.compare_mode,
         )
