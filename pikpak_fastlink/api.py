@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import math
 import socket
 import ssl
+import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 from http.client import HTTPException
 from typing import Callable
 from urllib.error import URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
-from pikpak_fastlink.auth import AuthConfig, OFFICIAL_HOST
+from pikpak_fastlink.auth import AuthConfig, OFFICIAL_HOST, _validate_secret
+from pikpak_fastlink.captcha import captcha_body
 from pikpak_fastlink.models import SourceRecord, normalize_gcid, parse_size
 
 
@@ -107,6 +111,8 @@ class PikPakClient:
         self.host = config.host
         self.timeout = timeout
         self._transport = transport or _default_transport
+        self._captcha_lock = threading.Lock()
+        self._captcha_tokens: dict[str, tuple[str, float]] = {}
         self._headers = {
             "Authorization": config.authorization,
             "X-Device-Id": config.device_id,
@@ -114,16 +120,69 @@ class PikPakClient:
             "Content-Type": "application/json",
         }
 
+    def _renew_captcha(self, action: str, rejected_token: str, previous_deadline: float | None) -> str | Decision:
+        with self._captcha_lock:
+            cached = self._captcha_tokens.get(action)
+            # Renewal may return the same token, so compare the cached issuance deadline.
+            if cached and cached[1] != previous_deadline and time.monotonic() < cached[1]:
+                return cached[0]
+            self._captcha_tokens.pop(action, None)
+            try:
+                body = captcha_body(self._headers["Authorization"], self._headers["X-Device-Id"], action, rejected_token)
+            except ValueError:
+                return Decision(DecisionKind.CREDENTIAL_FATAL, error="captcha renewal requires a valid login token")
+            headers = {key: value for key, value in self._headers.items() if key != "X-Captcha-Token"}
+            try:
+                result = self._transport(
+                    "POST", "https://user.mypikpak.com/v1/shield/captcha/init", headers,
+                    json.dumps(body, separators=(",", ":")).encode("utf-8"), self.timeout,
+                )
+            except Exception as exc:
+                return _transport_failure(exc)
+            failure = _http_failure(result)
+            if failure:
+                return failure
+            if result.payload.get("url"):
+                return Decision(DecisionKind.CREDENTIAL_FATAL, error="interactive captcha required; complete it in the browser")
+            token = result.payload.get("captcha_token")
+            lifetime = result.payload.get("expires_in")
+            try:
+                _validate_secret(token, "captcha_token")
+                if isinstance(lifetime, bool):
+                    raise ValueError()
+                lifetime = float(lifetime)
+                if not math.isfinite(lifetime) or lifetime <= 0:
+                    raise ValueError()
+            except (ValueError, TypeError, OverflowError):
+                return Decision(DecisionKind.RETRYABLE, error="invalid captcha issuance response")
+            self._captcha_tokens[action] = (token, time.monotonic() + max(0, lifetime - 30))
+            return token
+
     def _request(self, method: str, path: str, payload: dict | None = None) -> HttpResult | Decision:
-        try:
-            result = self._transport(
-                method, f"{self.host}{path}", dict(self._headers),
-                b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-                self.timeout,
-            )
-        except Exception as exc:
-            return _transport_failure(exc)
-        return _http_failure(result) or result
+        action = f"{method}:{urlsplit(path).path}"
+        with self._captcha_lock:
+            token, deadline = self._captcha_tokens.get(action, (self._headers["X-Captcha-Token"], None))
+        refreshed = False
+        if deadline is not None and time.monotonic() >= deadline:
+            token = self._renew_captcha(action, token, deadline)
+            if isinstance(token, Decision):
+                return token
+            refreshed = True
+        body = b"" if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        for _ in range(2):
+            headers = {**self._headers, "X-Captcha-Token": token}
+            try:
+                result = self._transport(method, f"{self.host}{path}", headers, body, self.timeout)
+            except Exception as exc:
+                return _transport_failure(exc)
+            if isinstance(result.payload, dict) and result.payload.get("error") == "captcha_invalid" and not refreshed:
+                token = self._renew_captcha(action, token, deadline)
+                if isinstance(token, Decision):
+                    return token
+                refreshed = True
+                continue
+            return _http_failure(result) or result
+        return Decision(DecisionKind.CREDENTIAL_FATAL, error="captcha token rejected after renewal")
 
     def list_page(self, *, parent_id: str, page_token: str = "", page_size: int = 500) -> Decision:
         query = urlencode({

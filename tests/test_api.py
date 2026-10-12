@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +35,141 @@ def client(transport):
         authorization="Bearer authorization-secret", device_id="device-secret",
         captcha_token="captcha-secret", transport=transport,
     )
+
+
+def jwt_client(transport):
+    payload = base64.urlsafe_b64encode(b'{"sub":"synthetic-user"}').decode().rstrip("=")
+    return PikPakClient(
+        authorization=f"Bearer header.{payload}.signature", device_id="device-secret",
+        captcha_token="seed-secret", transport=transport,
+    )
+
+
+def test_captcha_rejection_issues_write_action_then_retries_identical_transfer():
+    transport = FakeTransport(
+        HttpResult(400, {"error": "captcha_invalid"}),
+        HttpResult(200, {"captcha_token": "fresh-write-secret", "expires_in": 300}),
+        HttpResult(200, {"file": {"id": "created", "kind": "drive#file", "name": RECORD.file_name,
+                                "parent_id": "target", "hash": GCID, "size": "422649548",
+                                "phase": "PHASE_TYPE_COMPLETE"}}),
+    )
+    decision = jwt_client(transport).instant_transfer(record=RECORD, parent_id="target")
+    assert decision.kind is DecisionKind.COMPLETED
+    assert len(transport.calls) == 3
+    first, issuance, retry = transport.calls
+    assert issuance[:2] == ("POST", "https://user.mypikpak.com/v1/shield/captcha/init")
+    assert issuance[3] == {
+        "client_id": "YUMx5nI8ZU8Ap8pm", "action": "POST:/drive/v1/files",
+        "device_id": "device-secret", "captcha_token": "seed-secret",
+        "meta": {"captcha_sign": "1.8f6343b5f5f0f8bc54e7ab84971b69a0", "client_version": "2.0.0",
+                 "package_name": "mypikpak.com", "timestamp": "1791533770303", "user_id": "synthetic-user"},
+    }
+    assert issuance[2]["Authorization"] == first[2]["Authorization"]
+    assert "X-Captcha-Token" not in issuance[2]
+    assert retry[:2] == first[:2] and retry[3:] == first[3:]
+    assert retry[2]["X-Captcha-Token"] == "fresh-write-secret"
+
+
+def test_captcha_expiry_refreshes_before_request_and_uses_server_lifetime(monkeypatch):
+    from pikpak_fastlink import api
+    now = [100.0]
+    monkeypatch.setattr(api.time, "monotonic", lambda: now[0])
+    page = HttpResult(200, {"files": [], "next_page_token": ""})
+    transport = FakeTransport(
+        HttpResult(400, {"error": "captcha_invalid"}),
+        HttpResult(200, {"captcha_token": "read-secret", "expires_in": 300}), page, page,
+        HttpResult(200, {"captcha_token": "renewed-secret", "expires_in": 300}), page,
+    )
+    instance = jwt_client(transport)
+    assert instance.list_page(parent_id="").kind is DecisionKind.COMPLETED
+    now[0] = 369.0
+    assert instance.list_page(parent_id="").kind is DecisionKind.COMPLETED
+    now[0] = 370.0
+    assert instance.list_page(parent_id="").kind is DecisionKind.COMPLETED
+    assert [call[0] for call in transport.calls] == ["GET", "POST", "GET", "GET", "POST", "GET"]
+    assert transport.calls[4][3]["action"] == "GET:/drive/v1/files"
+    assert transport.calls[-1][2]["X-Captcha-Token"] == "renewed-secret"
+
+
+def test_captcha_cache_keeps_list_and_create_actions_separate():
+    page = HttpResult(200, {"files": [], "next_page_token": ""})
+    folder = HttpResult(200, {"file": {"id": "created", "kind": "drive#folder", "name": "probe", "parent_id": ""}})
+    transport = FakeTransport(
+        HttpResult(400, {"error": "captcha_invalid"}),
+        HttpResult(200, {"captcha_token": "list-secret", "expires_in": 300}), page,
+        HttpResult(400, {"error": "captcha_invalid"}),
+        HttpResult(200, {"captcha_token": "write-secret", "expires_in": 300}), folder, page, folder,
+    )
+    instance = jwt_client(transport)
+    assert instance.list_page(parent_id="").kind is DecisionKind.COMPLETED
+    assert instance.mkdir(parent_id="", name="probe").kind is DecisionKind.DIRECTORY_CREATED
+    assert instance.list_page(parent_id="").kind is DecisionKind.COMPLETED
+    assert instance.mkdir(parent_id="", name="probe").kind is DecisionKind.DIRECTORY_CREATED
+    assert [transport.calls[i][3]["action"] for i in (1, 4)] == ["GET:/drive/v1/files", "POST:/drive/v1/files"]
+    assert transport.calls[6][2]["X-Captcha-Token"] == "list-secret"
+    assert transport.calls[7][2]["X-Captcha-Token"] == "write-secret"
+
+
+@pytest.mark.parametrize("response,kind", [
+    (HttpResult(200, {"url": "https://challenge.invalid/credential-secret", "captcha_token": "challenge-secret", "expires_in": 300}), DecisionKind.CREDENTIAL_FATAL),
+    (HttpResult(401, {"error": "unauthenticated", "error_description": "credential-secret"}), DecisionKind.CREDENTIAL_FATAL),
+    (HttpResult(429, {}), DecisionKind.RETRYABLE),
+    *[(HttpResult(200, {"captcha_token": "new-secret", "expires_in": value}), DecisionKind.RETRYABLE)
+      for value in (0, -1, True, None, "NaN", "inf", 10**400)],
+    (HttpResult(200, {"captcha_token": "secret\r\nInjected: value", "expires_in": 300}), DecisionKind.RETRYABLE),
+])
+def test_captcha_issuance_errors_do_not_retry_business_request_or_expose_secrets(response, kind):
+    transport = FakeTransport(HttpResult(400, {"error": "captcha_invalid"}), response)
+    decision = jwt_client(transport).list_page(parent_id="")
+    assert decision.kind is kind
+    assert len(transport.calls) == 2
+    assert "secret" not in repr(decision)
+
+
+@pytest.mark.parametrize("raw_payload", [b"{}", b'{"sub":""}', b'{"sub":null}', b'{"sub":1}', b"[]", b"invalid json"])
+def test_captcha_renewal_rejects_missing_user_subject_without_issuing(raw_payload):
+    payload = base64.urlsafe_b64encode(raw_payload).decode().rstrip("=")
+    transport = FakeTransport(HttpResult(400, {"error": "captcha_invalid"}))
+    instance = PikPakClient(authorization=f"Bearer header.{payload}.signature", device_id="device-secret",
+                           captcha_token="seed-secret", transport=transport)
+    decision = instance.list_page(parent_id="")
+    assert decision.kind is DecisionKind.CREDENTIAL_FATAL
+    assert len(transport.calls) == 1 and "secret" not in repr(decision)
+
+
+def test_second_captcha_rejection_stops_after_one_issuance():
+    transport = FakeTransport(
+        HttpResult(400, {"error": "captcha_invalid"}),
+        HttpResult(200, {"captcha_token": "new-secret", "expires_in": 300}),
+        HttpResult(400, {"error": "captcha_invalid", "error_description": "new-secret"}),
+    )
+    decision = jwt_client(transport).list_page(parent_id="")
+    assert decision.kind is DecisionKind.CREDENTIAL_FATAL
+    assert len(transport.calls) == 3 and "secret" not in repr(decision)
+
+
+@pytest.mark.parametrize("issued_token", ["shared-secret", "seed-secret"])
+def test_concurrent_captcha_rejections_share_one_issuance(issued_token):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    rejected = Barrier(2)
+    issued = []
+
+    def transport(method, url, headers, body, timeout):
+        if url.endswith("/captcha/init"):
+            issued.append(json.loads(body)["action"])
+            return HttpResult(200, {"captcha_token": issued_token, "expires_in": 300})
+        if not issued:
+            rejected.wait(timeout=3)
+            return HttpResult(400, {"error": "captcha_invalid"})
+        assert headers["X-Captcha-Token"] == issued_token
+        return HttpResult(200, {"files": [], "next_page_token": ""})
+
+    instance = jwt_client(transport)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(instance.list_page, parent_id="") for _ in range(2)]
+        assert all(future.result(timeout=5).kind is DecisionKind.COMPLETED for future in futures)
+    assert issued == ["GET:/drive/v1/files"]
 
 
 def test_list_uses_server_token_even_when_server_exceeds_requested_limit():

@@ -2,7 +2,7 @@
 
 PikPak 自用秒传工具：浏览器登录后复制短期凭据，Python 读取项目目录的 `.env`，执行本地计算、保留目录结构的秒传导入、云端递归导出、目录比对、批量处理与断点续跑。
 
-网络请求使用 `curl_cffi` 的 Chrome impersonation。工具采用严格秒传：服务器确认文件内容已完成才记为成功；未命中时记录 `not_reusable`，不发送文件正文。它不自动登录或刷新 token，也不执行文件删除、覆盖、移动或 OSS 普通上传。
+网络请求使用 `curl_cffi` 的 Chrome impersonation。工具采用严格秒传：服务器确认文件内容已完成才记为成功；未命中时记录 `not_reusable`，不发送文件正文。它使用当前登录凭据自动颁发和续期 captcha token，不自动登录或续期 access token，也不执行文件删除、覆盖、移动或 OSS 普通上传。
 
 ## 安装与入口
 
@@ -30,13 +30,15 @@ PIKPAK_DEVICE_ID=""
 PIKPAK_CAPTCHA_TOKEN=""
 ```
 
-`PIKPAK_AUTHORIZATION` 是完整的 `Bearer …` 请求头值。脚本从官方请求捕获当前 Authorization 和设备 ID；点击按钮时，调用已登录页面的 SDK 获取一次新的 `POST:/drive/v1/files` captcha token，再复制三项为 `.env` 文本。只读请求里的 token 不一定适用于创建文件，不能直接当成永久通用 token。
+`PIKPAK_AUTHORIZATION` 是完整的 `Bearer …` 请求头值。脚本从官方请求捕获当前 Authorization 和设备 ID；点击按钮时，调用已登录页面的 SDK 获取一次新的 `POST:/drive/v1/files` captcha token，再复制三项为 `.env` 文本。这个 token 是启动凭据；Python 在需要时按请求 action 重新颁发。读列表和创建文件分别使用 `GET:/drive/v1/files` 与 `POST:/drive/v1/files` 的 action token。
 
 缺少完整凭据或页面 SDK 未就绪时，先刷新并登录，在网页中操作目录后再复制。复制期间登录或设备发生变化时不输出旧凭据；若网页 SDK 要求交互验证，由用户在网页完成。按钮不维护后台刷新，也不创建云盘文件。它只负责短期凭据复制，不提供秒传导入或导出 UI。
 
 Python 默认读取包所在项目目录的 `.env`，与当前工作目录无关；同名进程环境变量优先。`.env` 为普通文本，不需要加密或密钥库。`.env`、运行状态和 E2E 目录已被 Git 忽略，仓库只提供空值 `.env.example`。不要把真实凭据提交到 Git。
 
-凭据失效时命令停止，并保留可续跑的状态。重新通过浏览器复制凭据、更新 `.env`，再执行原命令即可。curl impersonation 不保证风控一定放行；本工具不自动处理验证挑战。
+Python 遇到 `captcha_invalid` 时调用官方 `/v1/shield/captcha/init`，颁发当前 `HTTP方法:路径` 所需的 token，再重发一次原请求。颁发元数据的 `user_id` 来自当前 access token 的 `sub`；这只是元数据提取，鉴权仍由服务器完成。新 token 按 action 在内存中缓存；下一次请求前根据 `expires_in` 提前 30 秒续期，同一客户端的并发续期串行处理。有效期以服务器返回的 `expires_in` 为准，复制出来的 token 是短期启动凭据。
+
+access token 失效、需要交互验证或续期后仍被拒绝时，命令停止并保留可续跑状态。重新在浏览器完成登录或验证、更新 `.env`，再执行原命令即可。工具不改写 `.env`，不自动解决验证挑战。颁发签名采用当前网页的公开签名配置，保存在 `pikpak_fastlink/captcha.py`；网页配置变化时需要更新。curl impersonation 不保证风控一定放行。
 
 ## 文件夹 ID 与 JSON 格式
 
@@ -96,7 +98,7 @@ python pikpak.py export-json --source-parent-id <folder-id> --output-file remote
 
 - 原命令使用相同清单、目标 ID 和状态路径重跑；已完成记录跳过。
 - 状态绑定清单内容 SHA-256 和目标目录，输入变化或换目标时使用新状态文件。
-- 429、服务端错误和传输失败进行有限重试；凭据失效停止继续调度。
+- 429、服务端错误和传输失败进行有限重试；`captcha_invalid` 先尝试颁发一次当前 action 的 token，无法恢复的鉴权或交互验证停止继续调度。
 - 创建目录或文件的响应丢失时，先重新查询目标目录，再决定是否重试，避免盲目重复创建。
 - 失败或未命中的记录写入状态旁的 `.retry.export.json`。
 - `--retry-failed` 重试失败和 `not_reusable` 记录；全部完成后移除过期的 retry 清单。
@@ -148,6 +150,6 @@ python -m pytest -q
 node --test tests/test_userscript.cjs
 ```
 
-Python 测试覆盖真实 PikPak 协议形状、环境加载、指纹请求选项、严格秒传判定、分页、目录冲突、重试、续跑、批量操作与原子输出；油猴测试覆盖请求观察和复制行为。测试仅使用合成凭据，真实账号验证限定在 `probe/` 内。
+Python 测试覆盖真实 PikPak 协议形状、action 对应的 captcha 颁发、有效期续期、并发续期、验证挑战与凭据脱敏，以及环境加载、指纹请求选项、严格秒传判定、分页、目录冲突、重试、续跑、批量操作与原子输出；油猴测试覆盖请求观察和复制行为。测试仅使用合成凭据，真实账号验证限定在 `probe/` 内。
 
 浏览器主世界注入验证可检查实际请求捕获与 UI，但不等同于安装 Tampermonkey 后的扩展沙箱验证。专门用于秒传提取/导入的油猴脚本不属于本项目当前实现范围。
