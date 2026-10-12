@@ -1,28 +1,28 @@
 # PikPak Fastlink PyFork
 
-PikPak 自用秒传工具：浏览器登录后复制短期凭据，Python 读取项目目录的 `.env`，执行本地计算、保留目录结构的秒传导入、云端递归导出、目录比对、批量处理与断点续跑。
+A personal PikPak instant-transfer CLI. Sign in through the browser, copy the current credentials, and use Python to calculate local manifests, import files with their directory structure, export cloud manifests, compare directories, and resume batch jobs.
 
-网络请求使用 `curl_cffi` 的 Chrome impersonation。工具采用严格秒传：服务器确认文件内容已完成才记为成功；未命中时记录 `not_reusable`，不发送文件正文。它使用当前登录凭据自动颁发和续期 captcha token，不自动登录或续期 access token，也不执行文件删除、覆盖、移动或 OSS 普通上传。
+Requests use `curl_cffi` with Chrome impersonation. Transfers are strictly instant: a file succeeds only when the server confirms that its content is complete. A miss is recorded as `not_reusable`; the tool never uploads file content. Captcha tokens are issued and renewed using the current login credentials. Access-token renewal and interactive verification remain browser tasks. The tool does not delete, overwrite, move, or perform ordinary OSS uploads.
 
-## 安装与入口
+## Installation and entry points
 
-需要 Python 3.11 或更高版本。在本目录执行：
+Requires Python 3.11 or newer. Run from this directory:
 
 ```bash
 python -m pip install -e .
 python pikpak.py --help
 ```
 
-也可以使用 `python -m pikpak_fastlink` 或安装后的 `pikpak-fastlink` 命令。下面统一使用 `python pikpak.py`；参数相同。
+`python -m pikpak_fastlink` and the installed `pikpak-fastlink` command accept the same arguments. Examples below use `python pikpak.py`.
 
-## 浏览器凭据 → .env
+## Browser credentials
 
-1. 在 Tampermonkey 中安装 `userscripts/pikpak-credentials.user.js`。
-2. 重新加载 `https://mypikpak.com/` 并登录，打开一个目录以触发 API 请求。
-3. 点击右下角“复制 PikPak .env 凭据”。
-4. 将剪贴板内容粘贴到本项目根目录的 `.env`，与 `pikpak.py` 同目录。
+1. Install `userscripts/pikpak-credentials.user.js` in Tampermonkey.
+2. Reload `https://mypikpak.com/`, sign in, and open a directory to trigger an API request.
+3. Click the credential-copy button in the bottom-right panel.
+4. Paste the clipboard contents into `.env` beside `pikpak.py`.
 
-格式如下，空值由真实捕获值替换：
+The clipboard output uses these three fields:
 
 ```dotenv
 PIKPAK_AUTHORIZATION=""
@@ -30,21 +30,25 @@ PIKPAK_DEVICE_ID=""
 PIKPAK_CAPTCHA_TOKEN=""
 ```
 
-`PIKPAK_AUTHORIZATION` 是完整的 `Bearer …` 请求头值。脚本从官方请求捕获当前 Authorization 和设备 ID；点击按钮时，调用已登录页面的 SDK 获取一次新的 `POST:/drive/v1/files` captcha token，再复制三项为 `.env` 文本。这个 token 是启动凭据；Python 在需要时按请求 action 重新颁发。读列表和创建文件分别使用 `GET:/drive/v1/files` 与 `POST:/drive/v1/files` 的 action token。
+Fill the empty values with the captured credentials. `PIKPAK_AUTHORIZATION` is the complete `Bearer ...` header value. The userscript observes Authorization and the device ID from official requests. When clicked, it asks the logged-in page SDK for a fresh `POST:/drive/v1/files` captcha token and copies all three values as `.env` text. This token bootstraps the Python client; the client issues replacements for the required request action. Listing and creation use `GET:/drive/v1/files` and `POST:/drive/v1/files`, respectively.
 
-缺少完整凭据或页面 SDK 未就绪时，先刷新并登录，在网页中操作目录后再复制。复制期间登录或设备发生变化时不输出旧凭据；若网页 SDK 要求交互验证，由用户在网页完成。按钮不维护后台刷新，也不创建云盘文件。它只负责短期凭据复制，不提供秒传导入或导出 UI。
+If credentials or the SDK are unavailable, reload, sign in, and navigate to a directory before copying again. The userscript checks that the login and device remain unchanged during copying. Complete any interactive verification in the browser. The button copies credentials only: it has no background renewal or transfer UI and creates no cloud files.
 
-Python 默认读取包所在项目目录的 `.env`，与当前工作目录无关；同名进程环境变量优先。`.env` 为普通文本，不需要加密或密钥库。`.env`、运行状态和 E2E 目录已被 Git 忽略，仓库只提供空值 `.env.example`。不要把真实凭据提交到 Git。
+Python loads `.env` from the project directory containing the package, regardless of the working directory. Process environment variables take precedence. Keep this plain-text secret file private. `.env`, runtime state, and E2E directories are Git-ignored; `.env.example` contains empty placeholders. Never commit real credentials.
 
-Python 遇到 `captcha_invalid` 时调用官方 `/v1/shield/captcha/init`，颁发当前 `HTTP方法:路径` 所需的 token，再重发一次原请求。颁发元数据的 `user_id` 来自当前 access token 的 `sub`；这只是元数据提取，鉴权仍由服务器完成。新 token 按 action 在内存中缓存；下一次请求前根据 `expires_in` 提前 30 秒续期，同一客户端的并发续期串行处理。有效期以服务器返回的 `expires_in` 为准，复制出来的 token 是短期启动凭据。
+### Captcha renewal
 
-access token 失效、需要交互验证或续期后仍被拒绝时，命令停止并保留可续跑状态。重新在浏览器完成登录或验证、更新 `.env`，再执行原命令即可。工具不改写 `.env`，不自动解决验证挑战。颁发签名采用当前网页的公开签名配置，保存在 `pikpak_fastlink/captcha.py`；网页配置变化时需要更新。curl impersonation 不保证风控一定放行。
+On `captcha_invalid`, Python calls the official `/v1/shield/captcha/init` endpoint for the current `HTTP method:path` action, then resends the original request once. Issuance metadata takes `user_id` from the access token's `sub`; decoding this field does not authenticate the token. Authentication remains server-side.
 
-## 文件夹 ID 与 JSON 格式
+New captcha tokens are cached per action in memory. Before the next request, the client renews a token within 30 seconds of its server-reported expiry. Concurrent renewal is serialized within each client. Token lifetime comes from `expires_in`; a copied token is a short-lived bootstrap credential.
 
-远程参数使用 PikPak 的不透明字符串文件夹 ID；可从网页请求的 `parent_id` 获取。参数中的 `root` 表示云盘根目录。首次验证应使用专门的 `probe/` 文件夹及其子目录。
+An expired access token, an interactive challenge, or rejection after renewal stops the command while preserving resumable state. Complete login or verification in the browser, update `.env`, and rerun the command. Python does not rewrite `.env` or solve challenges. Public web signing constants are stored in `pikpak_fastlink/captcha.py` and must be updated if PikPak changes that configuration. Chrome impersonation does not guarantee that risk checks will accept a request.
 
-导入和导出使用同一种 JSON：
+## Folder IDs and manifest format
+
+Remote arguments use PikPak's opaque folder IDs, available as `parent_id` in browser requests. `root` selects the cloud-drive root. Use a dedicated `probe/` folder and its children for initial live validation.
+
+Import and export share this JSON format:
 
 ```json
 {
@@ -58,11 +62,11 @@ access token 失效、需要交互验证或续期后仍被拒绝时，命令停�
 }
 ```
 
-示例 GCID 只是格式占位值，实际文件应由计算器或云端导出取得。必需字段为 `path`、40 位十六进制 `gcid`、非负字节大小 `size`。远程 API 的 `hash` 映射为 JSON 的 `gcid`；输出 GCID 统一为大写。云端导出还可带 `fileId` 和 `parentId`，导入不依赖它们。
+The all-zero GCID is a format placeholder. Obtain real values from the local calculator or a cloud export. Each entry requires a `path`, a 40-character hexadecimal `gcid`, and a non-negative byte `size`. The API's `hash` maps to `gcid`; output GCIDs are uppercase. Exports may also include `fileId` and `parentId`, which imports do not require.
 
-路径相对于指定的远程目标目录；导入会建立文件路径需要的子目录。`..`、反斜杠和歧义路径被拒绝。同名冲突不覆盖、不删除。清单只描述文件及其父路径，不单独保存空目录。
+Paths are relative to the selected remote directory. Imports create the parent directories needed by file paths. Parent traversal, backslashes, and ambiguous paths are rejected. Name conflicts never cause overwrites or deletions. Manifests describe files and their parent paths, not empty directories.
 
-## 本地计算与保留结构上传
+## Local calculation and structured import
 
 ```bash
 python pikpak.py generate-json --source-dir Movies --output-file movies.json --workers 8
@@ -70,49 +74,49 @@ python pikpak.py import-json --file movies.json --target-parent-id <folder-id> -
 python pikpak.py import-json --file movies.json --target-parent-id <folder-id> --state-file .state/movies.sqlite3 --workers 4
 ```
 
-例如本地 `Movies/Season 01/episode.mkv` 对应目标目录中的 `Season 01/episode.mkv`。本地源目录的名称不会自动加到清单路径前面；想保留这个外层名称，可先在云盘建立同名目标目录。
+`Movies/Season 01/episode.mkv` becomes `Season 01/episode.mkv` beneath the remote target. The source directory's name is not added to manifest paths. To preserve it, create a same-named remote directory and select it as the target.
 
-本地计算不需要凭据。独立计算器也可在未安装第三方依赖时运行：
+Local calculation needs no credentials. The standalone calculator also runs without third-party dependencies:
 
 ```bash
 python pikpak_fastlink/local_calculator.py --source-dir Movies --output-file movies.json --workers 8
 ```
 
-GCID 是按文件顺序拼接各块 SHA-1 二进制摘要后，再做一次 SHA-1。块大小匹配 PikPak 网页 WASM：用文件大小的低 32 位选择 256 KiB 至 2 MiB 的块，实际读取、哈希和输出大小仍覆盖完整文件。已对照网页 WASM 的空文件、`abc` 和大小边界；大于 4 GiB 的完整文件哈希在服务器和其他客户端上的兼容性尚未验证。
+GCID is SHA-1 over the ordered concatenation of each block's binary SHA-1 digest. Block selection matches the web WASM implementation: the low 32 bits of the file size select blocks from 256 KiB to 2 MiB, while reading, hashing, and the output size cover the entire file. Server and other-client compatibility for complete files above 4 GiB remains unverified.
 
-计算期间检查文件大小、时间和已打开文件身份，读队列有界。检测到变化或输出失败时保留原输出。降低 `--workers` 可减少机械硬盘上的并发读取。
+The calculator uses bounded read queues and checks size, timestamps, and the opened file's identity for changes. A changed input or output failure preserves the existing output. Reduce `--workers` to limit concurrent reads on mechanical disks.
 
-## 在线提取秒传 JSON
+## Cloud manifest export
 
 ```bash
 python pikpak.py export-json --source-parent-id <folder-id> --output-file remote.json --state-file .state/export.state.json --workers 4
 ```
 
-递归读取文件夹和服务器分页 token，从文件的 `name/hash/size` 构建保留相对路径的清单，无需下载内容。输出是本工具可导入的 JSON，不是官方分享链接。
+Export recursively lists directories and follows server pagination tokens. It builds relative paths from file `name`, `hash`, and `size` without downloading content. The result is an importable manifest for this tool, not an official share link.
 
-列表完整性检查覆盖分页 token、重复 ID/名称、父目录、文件名和已完成文件的哈希/大小。短页和空中间页不代表结束，只有空的 `next_page_token` 表示结束。歧义或不完整扫描不会发布部分输出。扫描源不是目录快照，运行时尽量保持源目录稳定。
+Listing validation covers pagination tokens, duplicate IDs and names, parent directories, file names, and completed-file hashes and sizes. Short pages and empty intermediate pages do not end pagination; only an empty `next_page_token` does. Ambiguous or incomplete scans never publish partial output. A scan is not a directory snapshot, so keep the source stable while it runs.
 
-中断后用相同参数重跑，从导出检查点继续；完成的状态对应已有结果。如需重新扫描变化后的远程目录，应使用新的状态文件。
+Rerun an interrupted export with the same arguments to resume its checkpoint. Completed state refers to the existing result. Use a new state file to scan a changed remote directory again.
 
-## 重试与续跑
+## Retries and resumption
 
-- 原命令使用相同清单、目标 ID 和状态路径重跑；已完成记录跳过。
-- 状态绑定清单内容 SHA-256 和目标目录，输入变化或换目标时使用新状态文件。
-- 429、服务端错误和传输失败进行有限重试；`captcha_invalid` 先尝试颁发一次当前 action 的 token，无法恢复的鉴权或交互验证停止继续调度。
-- 创建目录或文件的响应丢失时，先重新查询目标目录，再决定是否重试，避免盲目重复创建。
-- 失败或未命中的记录写入状态旁的 `.retry.export.json`。
-- `--retry-failed` 重试失败和 `not_reusable` 记录；全部完成后移除过期的 retry 清单。
-- import 命令遇到失败、凭据失效或秒传未命中时返回非零退出码。
+- Rerun with the same manifest, target ID, and state path; completed records are skipped.
+- State is bound to the manifest's SHA-256 and the target directory. Changed input or a different target requires new state.
+- HTTP 429, server errors, and transport failures receive bounded retries. `captcha_invalid` first triggers one issuance attempt for the current action. Unrecoverable authentication or interactive verification stops further scheduling.
+- If a creation response is lost, the tool queries the target directory before deciding whether to retry, avoiding blind duplicate creation.
+- Failed and non-reusable records are written to a `.retry.export.json` beside the state file.
+- `--retry-failed` retries failed and `not_reusable` records. Once all records complete, obsolete retry manifests are removed.
+- Import commands return a nonzero exit status for failures, unrecoverable credentials, or instant-transfer misses.
 
 ```bash
 python pikpak.py import-json --file movies.json --target-parent-id <folder-id> --state-file .state/movies.sqlite3 --retry-failed --max-retries 5 --flush-every 100
 ```
 
-服务器在秒传未命中时可能先创建一个未完成的云盘条目。工具报告未命中，不自动删除它；该条目也不会被当成已完成文件。若它造成同名冲突，需在网页中自行确认处理后再重试。
+An instant-transfer miss may leave a server-created incomplete file. The tool reports the miss and leaves that file intact; incomplete files do not count as completed content. If it creates a name conflict, inspect it in the browser before retrying.
 
-状态按任务、目标和账号分别保存，不跨账号复用；工具没有账号管理功能。
+Keep state separate for each job, target, and account. The tool has no account-management UI.
 
-## 批量导入与批量比对
+## Batch import and comparison
 
 ```bash
 python pikpak.py batch-import-json --input-dir manifests --target-parent-id <folder-id> --state-dir .state/import --json-parallelism 2 --workers 4 --dry-run
@@ -120,29 +124,29 @@ python pikpak.py batch-import-json --input-dir manifests --target-parent-id <fol
 python pikpak.py batch-check-json --input-dir manifests --target-parent-id <folder-id> --state-dir .state/check --output-dir deltas --with-checksum
 ```
 
-批量命令递归发现输入目录的 JSON，为每个清单保存独立状态。所有清单的文件路径都相对于同一个远程目标；不会按 JSON 文件名额外建立一层目录。导入前检查跨清单路径冲突。输入、状态、差异输出目录必须互不重叠。
+Batch commands recursively discover JSON manifests and maintain separate state for each one. All paths are relative to the same remote target; JSON file names do not introduce another directory level. Imports validate cross-manifest path conflicts before creating files. Input, state, and delta-output directories must not overlap.
 
-`batch-check-json` 默认按路径判断存在性，`--with-checksum` 同时检查 GCID 和大小；输出只包含未对齐记录的 `.delta.export.json`，可再用于导入。未完成远程文件不算对齐。已完成的比对状态复用原结果，需要重新比对远程变化时使用新状态目录。
+`batch-check-json` checks paths by default. `--with-checksum` also compares GCID and size. Output `.delta.export.json` files contain only mismatched records and can be imported. Incomplete remote files are not matches. Completed checks reuse their stored results; use a new state directory to compare remote changes again.
 
-## 单目录比对
+## Single-directory comparison
 
-只比较相对路径，输出本地缺失于远端的路径：
+Compare relative paths and report local entries missing remotely:
 
 ```bash
 python pikpak.py compare-folder --local-folder Movies --remote-folder-id <folder-id>
 ```
 
-加 `--remote-only` 可反向比较。目录模式不读取内容、不计算本地哈希。
+`--remote-only` reverses the comparison. Directory mode reads neither file contents nor local hashes.
 
-按 GCID 比较已有清单和远程树，输出缺少的内容：
+Compare an existing manifest against remote content by GCID:
 
 ```bash
 python pikpak.py compare-folder --local-json movies.json --remote-folder-id <folder-id> --output-file missing.json
 ```
 
-JSON 模式以 GCID 判断内容存在性；远端重命名或平铺仍可匹配。同一内容的多个路径按内容存在处理。`--remote-only` 选择只在远端存在的内容。结果保留选定一侧的相对路径，并原子替换输出文件。
+JSON mode matches content even when remote files are renamed or flattened. Multiple paths for the same content are treated as present when that GCID exists. `--remote-only` selects content present only remotely. Output preserves paths from the selected side and atomically replaces the output file.
 
-## 验证
+## Verification
 
 ```bash
 python -m pip install -e '.[test]'
@@ -150,6 +154,6 @@ python -m pytest -q
 node --test tests/test_userscript.cjs
 ```
 
-Python 测试覆盖真实 PikPak 协议形状、action 对应的 captcha 颁发、有效期续期、并发续期、验证挑战与凭据脱敏，以及环境加载、指纹请求选项、严格秒传判定、分页、目录冲突、重试、续跑、批量操作与原子输出；油猴测试覆盖请求观察和复制行为。测试仅使用合成凭据，真实账号验证限定在 `probe/` 内。
+Python tests cover protocol shapes, action-specific captcha issuance, expiry and concurrent renewal, challenges and credential redaction, environment loading, transport options, strict instant-transfer decisions, pagination, directory conflicts, retries, checkpoints, batch operations, and atomic output. Userscript tests cover request observation and clipboard behavior. Tests use synthetic credentials; real-account validation is restricted to `probe/`.
 
-浏览器主世界注入验证可检查实际请求捕获与 UI，但不等同于安装 Tampermonkey 后的扩展沙箱验证。专门用于秒传提取/导入的油猴脚本不属于本项目当前实现范围。
+Browser main-world injection checks request capture and UI behavior but does not verify Tampermonkey's extension sandbox. A dedicated userscript for manifest extraction or import is outside this project's current scope.
